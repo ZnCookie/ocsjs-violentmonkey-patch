@@ -1,0 +1,170 @@
+name: 同步上游 OCS 并发布暴力猴版
+
+# 每 6 小时检查一次 ocsjs 的最新 Release，发现新版本就自动重新打补丁并发布。
+# 也可以在 Actions 页面手动触发（可选强制重建）。
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重建（即使该版本已经发布过）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ocs-vm-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ocsjs/ocsjs
+  ASSET_NAME: ocs.user.js
+  OUT_NAME: ocs.violentmonkey.user.js
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 查询上游最新版本
+        id: upstream
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
+          tag=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "$api" | jq -r '.tag_name // empty')
+          if [ -z "$tag" ]; then
+            echo "::error::未能取到上游版本号，可能被限流或上游无 Release"
+            exit 1
+          fi
+          ver="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "上游版本：$tag"
+
+      - name: 判断是否已发布
+        id: check
+        run: |
+          set -euo pipefail
+          if gh release view "ocs-${{ steps.upstream.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "版本 ${{ steps.upstream.outputs.tag }} 已发布过，跳过"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载上游脚本
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          mkdir -p upstream dist
+          url="https://github.com/${UPSTREAM_REPO}/releases/download/${{ steps.upstream.outputs.tag }}/${ASSET_NAME}"
+          echo "下载：$url"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+               --max-time 300 -o "upstream/${ASSET_NAME}" "$url"
+          ls -lh "upstream/${ASSET_NAME}"
+          head -3 "upstream/${ASSET_NAME}"
+
+      - name: 打补丁构建
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          # 固定更新链接由 --repo 自动生成（默认 GitHub Release；
+          # 想换成 jsDelivr 可加 --cdn jsdelivr，并启用文末的「提交产物到仓库」步骤）
+          python3 scripts/build_vm.py \
+            --src "upstream/${ASSET_NAME}" \
+            --dst "dist/${OUT_NAME}" \
+            --expect-version "${{ steps.upstream.outputs.ver }}" \
+            --repo "${GITHUB_REPOSITORY}"
+
+      - name: 产物自检
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          f="dist/${OUT_NAME}"
+          test -s "$f" || { echo "::error::产物为空"; exit 1; }
+          head -1 "$f" | grep -q '==UserScript==' || { echo "::error::元数据头缺失"; exit 1; }
+          if sed -n '/==UserScript==/,/==\/UserScript==/p' "$f" | grep -qE '@grant[[:space:]]+GM_(getTab|saveTab)'; then
+            echo "::error::仍然残留 GM_getTab / GM_saveTab 的 grant"; exit 1
+          fi
+          grep -q 'Violentmonkey Patch' "$f" || { echo "::error::兼容层缺失"; exit 1; }
+          grep -q "@version[[:space:]]*${{ steps.upstream.outputs.ver }}$" <(sed -n '/==UserScript==/,/==\/UserScript==/p' "$f") \
+            || { echo "::error::版本号不符"; exit 1; }
+          echo "自检通过"
+
+      - name: 生成发布说明
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          cat > notes.md <<EOF
+          ## OCS 网课助手 · 暴力猴兼容版 ${{ steps.upstream.outputs.ver }}
+
+          由 [ocsjs/ocsjs](https://github.com/${{ env.UPSTREAM_REPO }}) 官方发布版自动构建，
+          构建脚本见本仓库 \`scripts/build_vm.py\`。
+
+          ### 与官方版的差异（仅 3 处）
+
+          1. 元数据：移除暴力猴不支持的 \`@grant GM_getTab\` / \`@grant GM_saveTab\`、\`@antifeature\`
+          2. 脚本顶部注入约 130 行兼容层，用 \`GM_setValue\` 模拟标签页级存储
+          3. 写入指向本仓库的 \`@updateURL\` / \`@downloadURL\`，安装后可自动更新
+
+          业务逻辑、UI、样式与官方版完全一致；在油猴 / 脚本猫下兼容层会自动跳过，行为不变。
+
+          ### 安装
+
+          直接点击下方 \`${{ env.OUT_NAME }}\` 或访问：
+          https://github.com/${{ github.repository }}/releases/latest/download/${{ env.OUT_NAME }}
+
+          请先卸载官方原版，避免两个悬浮窗同时出现。
+
+          ### 上游更新
+
+          - 官方 Release：https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.upstream.outputs.tag }}
+
+          ### 许可
+
+          原始脚本版权归原作者 enncy 所有，遵循 MIT License；
+          本构建产物同样以 MIT License 分发，保留原始版权声明。
+          EOF
+          cat notes.md
+
+      - name: 覆盖旧发布（强制重建时）
+        if: inputs.force && steps.check.outputs.exists == 'true'
+        run: gh release delete "ocs-${{ steps.upstream.outputs.tag }}" --yes --cleanup-tag || true
+
+      - name: 发布 Release
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          gh release create "ocs-${{ steps.upstream.outputs.tag }}" \
+            "dist/${OUT_NAME}#${OUT_NAME}" \
+            --title "OCS 暴力猴版 ${{ steps.upstream.outputs.ver }}" \
+            --notes-file notes.md
+
+      # 可选：把产物提交到仓库 dist/ 目录，供 jsDelivr / raw 链接使用。
+      # 启用后把上面的 --repo 改成 `--repo "${GITHUB_REPOSITORY}" --cdn jsdelivr`。
+      # - name: 提交产物到仓库
+      #   if: steps.check.outputs.exists == 'false' || inputs.force
+      #   run: |
+      #     git pull --rebase origin main
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add "dist/${OUT_NAME}"
+      #     git diff --staged --quiet || git commit -m "chore: 更新 ${OUT_NAME} (${{ steps.upstream.outputs.ver }})"
+      #     git push
+
+      - name: 保存产物（便于排查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocs-violentmonkey-${{ steps.upstream.outputs.ver || 'unknown' }}
+          path: dist/*.user.js
+          retention-days: 30
+          if-no-files-found: ignore
