@@ -1,0 +1,191 @@
+--- a/packages/scripts/entry.js	2026-10-18 04:56:04.104508379 +0800
++++ b/packages/scripts/entry.js	2026-10-18 04:56:00.780531975 +0800
+@@ -1,6 +1,173 @@
+ /* eslint-disable no-undef, max-len */
+ /// <reference path="./global.d.ts" />
+ 
++/* ============================================================
++ * [Violentmonkey Patch] GM_getTab / GM_saveTab 兼容层
++ * ------------------------------------------------------------
++ * 暴力猴只提供「脚本级」存储（GM_getValue/GM_setValue，跨标签页共享），
++ * 没有油猴的「标签页级」存储 GM_getTab / GM_saveTab。
++ * OCS 的 $store.getTab/setTab（来自 easy-us 的 GMStoreProvider）依赖这两个
++ * API 保存「临时数据」：面板名、URL 列表、答题结果面板、章节计数等。
++ *
++ * 这里用 GM_setValue 按「标签页 ID」分桶来模拟，语义尽量对齐：
++ *   - 顶层页面：标签页 ID 存于 sessionStorage（同标签页刷新保留、新标签页独立）
++ *   - 同源 iframe：sessionStorage 天然共享，直接拿到同一个 ID
++ *   - 跨域 iframe：拿不到父页面 sessionStorage，用「最近活跃标签页 + referrer」
++ *     推断，推断不到则退化为全局限一份（只在多标签页并发时可能串数据）
++ * 全部为同步调用，符合 GM_getTab 同步回调的约定。
++ * ============================================================ */
++(function () {
++	if (typeof globalThis.GM_getTab === 'function' && typeof globalThis.GM_saveTab === 'function') {
++		return; // 原生支持（油猴 / 脚本猫），不做任何处理
++	}
++
++	var DATA_PREFIX = '__ocs_vm_tab_data__'; // 每个标签页的临时数据
++	var ACTIVE_KEY = '__ocs_vm_tab_active__'; // 最近活跃的标签页（供跨域 iframe 推断）
++	var SS_KEY = '__ocs_vm_tab_uid__'; // 标签页 ID（sessionStorage）
++	var ALIVE_WINDOW = 60 * 60 * 1000; // 跨域 iframe 复用活跃标签页的时间窗
++
++	var isTop = (function () {
++		try {
++			return window.self === window.top;
++		} catch (e) {
++			return false;
++		}
++	})();
++
++	function uuid() {
++		var s = '';
++		for (var i = 0; i < 4; i++) {
++			s += Math.floor((1 + Math.random()) * 0x10000).toString(16).slice(1);
++		}
++		return s + '-' + Date.now().toString(16);
++	}
++
++	function readSession(key) {
++		try {
++			return window.sessionStorage.getItem(key);
++		} catch (e) {
++			return null;
++		}
++	}
++
++	function writeSession(key, val) {
++		try {
++			window.sessionStorage.setItem(key, val);
++		} catch (e) {
++			/* 隐私模式等场景静默失败 */
++		}
++	}
++
++	function gmGet(key, def) {
++		try {
++			if (typeof GM_getValue === 'function') {
++				var val = GM_getValue(key, def);
++				return val === undefined ? def : val;
++			}
++		} catch (e) {}
++		return def;
++	}
++
++	function gmSet(key, val) {
++		try {
++			if (typeof GM_setValue === 'function') {
++				GM_setValue(key, val);
++			}
++		} catch (e) {}
++	}
++
++	function referrerOrigin() {
++		try {
++			return document.referrer ? new URL(document.referrer).origin : '';
++		} catch (e) {
++			return '';
++		}
++	}
++
++	function sameOrigin(a, b) {
++		if (!a || !b) return false;
++		try {
++			return new URL(a).origin === new URL(b).origin;
++		} catch (e) {
++			return false;
++		}
++	}
++
++	var tabId = null;
++
++	function markActive(id) {
++		gmSet(ACTIVE_KEY, { uid: id, time: Date.now(), url: String(location.href) });
++	}
++
++	function getTabId() {
++		if (tabId) return tabId;
++
++		// 1) 同源会话：顶层与同源 iframe 共享
++		var id = readSession(SS_KEY);
++		if (id) {
++			tabId = id;
++			if (isTop) markActive(id);
++			return id;
++		}
++
++		// 2) 顶层：新建一个标签页 ID
++		if (isTop) {
++			id = uuid();
++			writeSession(SS_KEY, id);
++			markActive(id);
++			tabId = id;
++			return id;
++		}
++
++		// 3) 跨域 iframe：借用最近活跃、且 referrer 匹配的标签页 ID
++		var active = gmGet(ACTIVE_KEY, null);
++		if (active && active.uid && Date.now() - active.time < ALIVE_WINDOW) {
++			var ref = referrerOrigin();
++			if (!ref || !active.url || sameOrigin(ref, active.url)) {
++				tabId = active.uid;
++				writeSession(SS_KEY, tabId);
++				return tabId;
++			}
++		}
++
++		// 4) 兜底：无法识别的 frame 共用一份，保证功能不中断
++		tabId = 'shared';
++		return tabId;
++	}
++
++	function dataKey() {
++		return DATA_PREFIX + getTabId();
++	}
++
++	globalThis.GM_getTab = function (callback) {
++		var data = gmGet(dataKey(), null);
++		if (!data || typeof data !== 'object') data = {};
++		if (typeof callback === 'function') {
++			try {
++				callback(data);
++			} catch (e) {
++				console.error('[OCS-VM] GM_getTab callback error', e);
++			}
++		}
++		return data;
++	};
++
++	globalThis.GM_saveTab = function (tab) {
++		gmSet(dataKey(), tab && typeof tab === 'object' ? tab : {});
++	};
++
++	// 兜底：兼容把 window 与 globalThis 视为不同对象的沙箱实现
++	try {
++		if (typeof window !== 'undefined' && window !== globalThis) {
++			window.GM_getTab = globalThis.GM_getTab;
++			window.GM_saveTab = globalThis.GM_saveTab;
++		}
++	} catch (e) {}
++
++	console.log('[OCS-VM] 已启用暴力猴兼容层，标签页 ID：' + getTabId());
++})();
++/* ============================ Patch End ============================ */
++
+ // 环境检测
+ if (
+ 	[
+--- a/scripts/build-core.js	2026-10-18 04:56:04.106508365 +0800
++++ b/scripts/build-core.js	2026-10-18 04:56:00.781531968 +0800
+@@ -96,8 +96,10 @@
+ 				match: matchMetadata,
+ 				grant: [
+ 					'GM_info',
+-					'GM_getTab',
+-					'GM_saveTab',
++					// GM_getTab / GM_saveTab 为 Tampermonkey / ScriptCat 专有，
++					// 暴力猴（Violentmonkey）没有，由 entry.js 内的兼容层提供。
++					// 构建暴力猴版本：BUILD_FOR_VM=1 pnpm build
++					...(process.env.BUILD_FOR_VM ? [] : ['GM_getTab', 'GM_saveTab']),
+ 					'GM_setValue',
+ 					'GM_getValue',
+ 					'unsafeWindow',
